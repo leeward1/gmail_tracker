@@ -25,7 +25,17 @@ var CONFIG = {
   GMAIL_QUERY: 'newer_than:2y',
   MAX_THREADS: 200,  // Reduced for performance (runs faster, can run multiple times)
   CALENDAR_DAYS_BACK: 730,
-  MAX_LOG_ROWS: 100
+  MAX_LOG_ROWS: 100,
+
+  // Follow-up configuration
+  CRM_LABELS: {
+    NEEDS_RESPONSE: 'CRM/Needs-Response',
+    FOLLOW_UP: 'CRM/Follow-Up',
+    WAITING_REPLY: 'CRM/Waiting-Reply'
+  },
+  MY_EMAILS: [],  // Will be populated from Session + settings
+  MAX_THREADS_PER_LABEL: 2000,
+  PAGE_SIZE: 100
 };
 
 // ============================================================================
@@ -65,10 +75,18 @@ var INTEGRATIONS = {
     columns: []  // CRM_CampaignName, CRM_CampaignStatus added only when needed
   },
 
-  // Follow-up tracking (single column for status)
+  // Follow-up tracking (enhanced with timestamps and aging)
   followups: {
     enabled: true,
-    columns: ['CRM_FollowUpStatus']  // Values: Needs Response, Follow-Up, Waiting Reply
+    columns: [
+      'CRM_FollowUpStatus',      // Values: Needs Response, Follow-Up, Waiting Reply
+      'CRM_FollowUpStatusSetAt', // Datetime when status was set
+      'CRM_LastInboundAt',       // Last email received from contact
+      'CRM_LastOutboundAt',      // Last email sent to contact
+      'CRM_DaysInStatus',        // Days since status was set
+      'CRM_FollowUpSource',      // Label + subject snippet
+      'CRM_LastThreadId'         // Gmail thread ID for the winning thread
+    ]
   }
 
   // Add more integrations here:
@@ -95,7 +113,9 @@ function onOpen() {
     .addSubMenu(ui.createMenu('🔔 Follow-ups')
       .addItem('Setup Follow-up Labels', 'setupFollowUpLabels')
       .addItem('Scan for Needs Response', 'scanNeedsResponse')
-      .addItem('Sync Follow-up Status', 'syncFollowUps'))
+      .addItem('Sync Follow-up Status', 'syncFollowUps')
+      .addSeparator()
+      .addItem('Apply Formatting & Validation', 'setupFollowUpFormatting'))
     .addSubMenu(ui.createMenu('🚫 Exclude Settings')
       .addItem('Exclude Emails', 'addExcludeEmail')
       .addItem('Exclude Domains', 'addExcludeDomain')
@@ -1104,21 +1124,244 @@ function viewCampaigns() {
 }
 
 // ============================================================================
-// FOLLOW-UP & GMAIL LABELS
+// FOLLOW-UP & GMAIL LABELS (Enhanced with auto-transitions and aging)
 // ============================================================================
 
+// Legacy compatibility - use CONFIG.CRM_LABELS instead
 var FOLLOWUP_LABELS = {
   FOLLOWUP: 'CRM/Follow-Up',
   NEEDS_RESPONSE: 'CRM/Needs-Response',
   WAITING: 'CRM/Waiting-Reply'
 };
 
+/**
+ * Get list of "my" email addresses for determining sent vs received
+ */
+function getMyEmails() {
+  var emails = {};
+  // Primary email
+  emails[Session.getActiveUser().getEmail().toLowerCase()] = true;
+
+  // Check settings for aliases
+  var settings = getSettings();
+  var aliases = settings['MY_EMAIL_ALIASES'] || '';
+  if (aliases) {
+    var aliasList = aliases.split(',');
+    for (var i = 0; i < aliasList.length; i++) {
+      var alias = aliasList[i].trim().toLowerCase();
+      if (alias) emails[alias] = true;
+    }
+  }
+
+  return emails;
+}
+
+/**
+ * Check if an email is "from me"
+ */
+function isFromMe(email, myEmails) {
+  if (!email) return false;
+  return myEmails[email.toLowerCase()] === true;
+}
+
+/**
+ * Get thread activity (inbound/outbound timestamps)
+ */
+function getThreadActivity(thread, myEmails) {
+  var messages = thread.getMessages();
+  var result = {
+    lastInboundAt: null,
+    lastOutboundAt: null,
+    lastMessageAt: null,
+    lastMessageFromMe: false,
+    subject: thread.getFirstMessageSubject() || '(no subject)',
+    threadId: thread.getId(),
+    contactEmails: {}
+  };
+
+  for (var i = 0; i < messages.length; i++) {
+    var msg = messages[i];
+    var msgDate = msg.getDate();
+    var fromEmail = extractEmail(msg.getFrom());
+    var fromMe = isFromMe(fromEmail, myEmails);
+
+    // Track last message
+    if (!result.lastMessageAt || msgDate > result.lastMessageAt) {
+      result.lastMessageAt = msgDate;
+      result.lastMessageFromMe = fromMe;
+    }
+
+    if (fromMe) {
+      // Outbound
+      if (!result.lastOutboundAt || msgDate > result.lastOutboundAt) {
+        result.lastOutboundAt = msgDate;
+      }
+      // Collect external recipients
+      var toList = (msg.getTo() || '').split(',');
+      var ccList = (msg.getCc() || '').split(',');
+      var allRecipients = toList.concat(ccList);
+      for (var r = 0; r < allRecipients.length; r++) {
+        var recip = extractEmail(allRecipients[r]);
+        if (recip && !isFromMe(recip, myEmails)) {
+          result.contactEmails[recip] = true;
+        }
+      }
+    } else {
+      // Inbound
+      if (!result.lastInboundAt || msgDate > result.lastInboundAt) {
+        result.lastInboundAt = msgDate;
+      }
+      // Track sender as contact
+      if (fromEmail) {
+        result.contactEmails[fromEmail] = true;
+      }
+    }
+  }
+
+  return result;
+}
+
+/**
+ * Get all threads with a label using pagination (no 100-thread limit)
+ */
+function getAllLabeledThreads(labelName, maxThreads) {
+  var label = GmailApp.getUserLabelByName(labelName);
+  if (!label) return [];
+
+  var allThreads = [];
+  var start = 0;
+  var pageSize = CONFIG.PAGE_SIZE || 100;
+  var cap = maxThreads || CONFIG.MAX_THREADS_PER_LABEL || 2000;
+
+  while (allThreads.length < cap) {
+    var threads = label.getThreads(start, pageSize);
+    if (threads.length === 0) break;
+
+    allThreads = allThreads.concat(threads);
+    start += pageSize;
+
+    if (threads.length < pageSize) break; // No more pages
+  }
+
+  return allThreads.slice(0, cap);
+}
+
+/**
+ * Apply Mode B auto-transitions based on reply activity
+ */
+function applyAutoTransitions(thread, activity, myEmails) {
+  var transitions = { from: null, to: null };
+  var labels = thread.getLabels();
+  var labelNames = {};
+
+  for (var i = 0; i < labels.length; i++) {
+    labelNames[labels[i].getName()] = labels[i];
+  }
+
+  var hasNeedsResponse = labelNames[CONFIG.CRM_LABELS.NEEDS_RESPONSE];
+  var hasFollowUp = labelNames[CONFIG.CRM_LABELS.FOLLOW_UP];
+  var hasWaitingReply = labelNames[CONFIG.CRM_LABELS.WAITING_REPLY];
+
+  // Rule 1: Needs-Response + I replied → remove NR, add Waiting-Reply
+  if (hasNeedsResponse && activity.lastOutboundAt && activity.lastInboundAt) {
+    if (activity.lastOutboundAt > activity.lastInboundAt) {
+      transitions.from = 'Needs Response';
+      transitions.to = 'Waiting Reply';
+      thread.removeLabel(hasNeedsResponse);
+      var waitingLabel = GmailApp.getUserLabelByName(CONFIG.CRM_LABELS.WAITING_REPLY);
+      if (!waitingLabel) waitingLabel = GmailApp.createLabel(CONFIG.CRM_LABELS.WAITING_REPLY);
+      if (!hasWaitingReply) thread.addLabel(waitingLabel);
+    }
+  }
+
+  // Rule 2: Follow-Up + I replied → convert to Waiting-Reply
+  if (hasFollowUp && activity.lastOutboundAt && activity.lastInboundAt) {
+    if (activity.lastOutboundAt > activity.lastInboundAt) {
+      transitions.from = 'Follow-Up';
+      transitions.to = 'Waiting Reply';
+      thread.removeLabel(hasFollowUp);
+      var waitingLabel2 = GmailApp.getUserLabelByName(CONFIG.CRM_LABELS.WAITING_REPLY);
+      if (!waitingLabel2) waitingLabel2 = GmailApp.createLabel(CONFIG.CRM_LABELS.WAITING_REPLY);
+      if (!hasWaitingReply) thread.addLabel(waitingLabel2);
+    }
+  }
+
+  // Rule 3: Waiting-Reply + they replied → remove WR, add Needs-Response
+  if (hasWaitingReply && activity.lastInboundAt && activity.lastOutboundAt) {
+    if (activity.lastInboundAt > activity.lastOutboundAt) {
+      transitions.from = 'Waiting Reply';
+      transitions.to = 'Needs Response';
+      thread.removeLabel(hasWaitingReply);
+      var needsLabel = GmailApp.getUserLabelByName(CONFIG.CRM_LABELS.NEEDS_RESPONSE);
+      if (!needsLabel) needsLabel = GmailApp.createLabel(CONFIG.CRM_LABELS.NEEDS_RESPONSE);
+      if (!hasNeedsResponse) thread.addLabel(needsLabel);
+    }
+  }
+
+  return transitions;
+}
+
+/**
+ * Get current label status for a thread
+ */
+function getThreadLabelStatus(thread) {
+  var labels = thread.getLabels();
+  for (var i = 0; i < labels.length; i++) {
+    var name = labels[i].getName();
+    if (name === CONFIG.CRM_LABELS.NEEDS_RESPONSE) return 'Needs Response';
+    if (name === CONFIG.CRM_LABELS.FOLLOW_UP) return 'Follow-Up';
+    if (name === CONFIG.CRM_LABELS.WAITING_REPLY) return 'Waiting Reply';
+  }
+  return null;
+}
+
+/**
+ * Determine winner thread for a contact with multiple labeled threads
+ * Priority: Needs Response > Follow-Up > Waiting Reply
+ * Tie-breaker: most recent relevant timestamp
+ */
+function selectWinnerThread(candidates) {
+  if (candidates.length === 0) return null;
+  if (candidates.length === 1) return candidates[0];
+
+  var priorityOrder = { 'Needs Response': 1, 'Follow-Up': 2, 'Waiting Reply': 3 };
+
+  candidates.sort(function(a, b) {
+    // First by priority
+    var priorityDiff = (priorityOrder[a.status] || 99) - (priorityOrder[b.status] || 99);
+    if (priorityDiff !== 0) return priorityDiff;
+
+    // Tie-breaker by relevant timestamp
+    var aTime, bTime;
+    if (a.status === 'Needs Response') {
+      aTime = a.activity.lastInboundAt ? a.activity.lastInboundAt.getTime() : 0;
+      bTime = b.activity.lastInboundAt ? b.activity.lastInboundAt.getTime() : 0;
+    } else if (a.status === 'Waiting Reply') {
+      aTime = a.activity.lastOutboundAt ? a.activity.lastOutboundAt.getTime() : 0;
+      bTime = b.activity.lastOutboundAt ? b.activity.lastOutboundAt.getTime() : 0;
+    } else {
+      aTime = a.activity.lastMessageAt ? a.activity.lastMessageAt.getTime() : 0;
+      bTime = b.activity.lastMessageAt ? b.activity.lastMessageAt.getTime() : 0;
+    }
+
+    return bTime - aTime; // Descending (newer first)
+  });
+
+  return candidates[0];
+}
+
 function setupFollowUpLabels() {
   var ui = SpreadsheetApp.getUi();
   var created = [];
 
-  for (var key in FOLLOWUP_LABELS) {
-    var labelName = FOLLOWUP_LABELS[key];
+  var labelsToCreate = [
+    CONFIG.CRM_LABELS.NEEDS_RESPONSE,
+    CONFIG.CRM_LABELS.FOLLOW_UP,
+    CONFIG.CRM_LABELS.WAITING_REPLY
+  ];
+
+  for (var i = 0; i < labelsToCreate.length; i++) {
+    var labelName = labelsToCreate[i];
     var label = GmailApp.getUserLabelByName(labelName);
     if (!label) {
       GmailApp.createLabel(labelName);
@@ -1134,25 +1377,23 @@ function setupFollowUpLabels() {
   } else {
     ui.alert('Labels Ready',
       'All follow-up labels already exist:\n' +
-      Object.values(FOLLOWUP_LABELS).join('\n'),
+      labelsToCreate.join('\n'),
       ui.ButtonSet.OK);
   }
 }
 
 function scanNeedsResponse() {
   var ui = SpreadsheetApp.getUi();
-  var myEmail = Session.getActiveUser().getEmail().toLowerCase();
+  var myEmails = getMyEmails();
 
   // Get or create the Needs Response label
-  var label = GmailApp.getUserLabelByName(FOLLOWUP_LABELS.NEEDS_RESPONSE);
+  var label = GmailApp.getUserLabelByName(CONFIG.CRM_LABELS.NEEDS_RESPONSE);
   if (!label) {
-    label = GmailApp.createLabel(FOLLOWUP_LABELS.NEEDS_RESPONSE);
+    label = GmailApp.createLabel(CONFIG.CRM_LABELS.NEEDS_RESPONSE);
   }
 
   // Search for emails in inbox where last message is NOT from me
-  // Only look at recent emails (30 days) - older ones are less actionable
-  // Gmail label search requires quoting labels with special characters like /
-  var threads = GmailApp.search('is:inbox to:me newer_than:30d -label:"' + FOLLOWUP_LABELS.NEEDS_RESPONSE + '"', 0, 100);
+  var threads = GmailApp.search('is:inbox to:me newer_than:30d -label:"' + CONFIG.CRM_LABELS.NEEDS_RESPONSE + '"', 0, 100);
 
   var tagged = 0;
   var questionPatterns = [
@@ -1170,14 +1411,14 @@ function scanNeedsResponse() {
 
   for (var i = 0; i < threads.length; i++) {
     var thread = threads[i];
-    var messages = thread.getMessages();
-    var lastMsg = messages[messages.length - 1];
-    var fromEmail = extractEmail(lastMsg.getFrom());
+    var activity = getThreadActivity(thread, myEmails);
 
-    // Only tag if the last message is NOT from me (I haven't replied yet)
-    if (fromEmail === myEmail) continue;
+    // Only tag if the last message is NOT from me
+    if (activity.lastMessageFromMe) continue;
 
     // Check if message contains questions or requests
+    var messages = thread.getMessages();
+    var lastMsg = messages[messages.length - 1];
     var body = lastMsg.getPlainBody() || '';
     var subject = lastMsg.getSubject() || '';
     var text = subject + ' ' + body;
@@ -1198,15 +1439,18 @@ function scanNeedsResponse() {
 
   ui.alert('Scan Complete',
     'Emails tagged as needing response: ' + tagged + '\n\n' +
-    'Check your Gmail for the "' + FOLLOWUP_LABELS.NEEDS_RESPONSE + '" label.',
+    'Check your Gmail for the "' + CONFIG.CRM_LABELS.NEEDS_RESPONSE + '" label.',
     ui.ButtonSet.OK);
 }
 
 function syncFollowUps() {
   var result = syncFollowUpsInternal();
   SpreadsheetApp.getUi().alert('Follow-up Sync Complete',
-    'Contacts with follow-ups: ' + result.followups + '\n' +
+    'Threads scanned: ' + result.threadsScanned + '\n' +
+    'Auto-transitions: ' + result.transitions + '\n' +
     'Contacts needing response: ' + result.needsResponse + '\n' +
+    'Contacts with follow-ups: ' + result.followups + '\n' +
+    'Contacts waiting reply: ' + result.waitingReply + '\n' +
     'Statuses cleared: ' + result.cleared + '\n' +
     'Contacts updated: ' + result.updated,
     SpreadsheetApp.getUi().ButtonSet.OK);
@@ -1217,112 +1461,312 @@ function syncFollowUpsInternal() {
   var contactsSheet = ss.getSheetByName(CONFIG.CONTACTS_SHEET);
   var headers = getHeaderMap(contactsSheet);
 
+  // Ensure new columns exist
+  var requiredCols = [
+    'CRM_FollowUpStatus', 'CRM_FollowUpStatusSetAt', 'CRM_LastInboundAt',
+    'CRM_LastOutboundAt', 'CRM_DaysInStatus', 'CRM_FollowUpSource', 'CRM_LastThreadId'
+  ];
+  addHeadersIfMissing(contactsSheet, requiredCols);
+  headers = getHeaderMap(contactsSheet);
+
   if (!headers['CRM_FollowUpStatus']) {
-    return { followups: 0, needsResponse: 0, updated: 0, cleared: 0 };
+    return { threadsScanned: 0, transitions: 0, followups: 0, needsResponse: 0, waitingReply: 0, updated: 0, cleared: 0 };
   }
 
   var emailIndex = buildEmailIndex(contactsSheet);
-  var myEmail = Session.getActiveUser().getEmail().toLowerCase();
-  var stats = { followups: 0, needsResponse: 0, updated: 0, cleared: 0 };
+  var myEmails = getMyEmails();
+  var stats = {
+    threadsScanned: 0,
+    transitions: 0,
+    followups: 0,
+    needsResponse: 0,
+    waitingReply: 0,
+    updated: 0,
+    cleared: 0
+  };
 
-  // Track which contacts have active follow-up labels
-  var activeFollowUps = {};
+  // Collect all thread data by contact email
+  var contactThreads = {}; // email -> [{ status, activity, thread }]
 
-  // Check Needs Response labeled emails (user hasn't replied)
-  var needsResponseLabel = GmailApp.getUserLabelByName(FOLLOWUP_LABELS.NEEDS_RESPONSE);
-  if (needsResponseLabel) {
-    var needsResponseThreads = needsResponseLabel.getThreads(0, 100);
-    for (var j = 0; j < needsResponseThreads.length; j++) {
-      var thread = needsResponseThreads[j];
-      var messages = thread.getMessages();
-      var contactEmail = findExternalEmail(messages, myEmail);
+  // Process each label type with pagination
+  var labelTypes = [
+    { name: CONFIG.CRM_LABELS.NEEDS_RESPONSE, status: 'Needs Response' },
+    { name: CONFIG.CRM_LABELS.FOLLOW_UP, status: 'Follow-Up' },
+    { name: CONFIG.CRM_LABELS.WAITING_REPLY, status: 'Waiting Reply' }
+  ];
 
-      if (contactEmail) {
-        var normalizedEmail = contactEmail.toLowerCase();
-        var row = emailIndex[normalizedEmail];
-        if (row) {
-          // Only set if not already set to a higher priority status
-          if (!activeFollowUps[normalizedEmail]) {
-            setCell(contactsSheet, row, headers['CRM_FollowUpStatus'], 'Needs Response');
-            activeFollowUps[normalizedEmail] = 'Needs Response';
-            stats.needsResponse++;
-            stats.updated++;
-          }
+  for (var lt = 0; lt < labelTypes.length; lt++) {
+    var labelInfo = labelTypes[lt];
+    var threads = getAllLabeledThreads(labelInfo.name, CONFIG.MAX_THREADS_PER_LABEL);
+
+    for (var t = 0; t < threads.length; t++) {
+      var thread = threads[t];
+      stats.threadsScanned++;
+
+      var activity = getThreadActivity(thread, myEmails);
+
+      // Apply auto-transitions (Mode B)
+      var transition = applyAutoTransitions(thread, activity, myEmails);
+      if (transition.to) {
+        stats.transitions++;
+        logInfo('syncFollowUps', 'Transition: ' + transition.from + ' -> ' + transition.to + ' | ' + activity.subject.substring(0, 40));
+      }
+
+      // Get current status after transitions
+      var currentStatus = getThreadLabelStatus(thread);
+      if (!currentStatus) continue; // Label was removed by transition
+
+      // Map thread to all contact emails
+      for (var email in activity.contactEmails) {
+        var normalized = email.toLowerCase().trim();
+        if (!contactThreads[normalized]) {
+          contactThreads[normalized] = [];
         }
+        contactThreads[normalized].push({
+          status: currentStatus,
+          activity: activity,
+          thread: thread
+        });
       }
     }
   }
 
-  // Check Follow-Up labeled emails
-  var followUpLabel = GmailApp.getUserLabelByName(FOLLOWUP_LABELS.FOLLOWUP);
-  if (followUpLabel) {
-    var followUpThreads = followUpLabel.getThreads(0, 100);
-    for (var i = 0; i < followUpThreads.length; i++) {
-      var thread = followUpThreads[i];
-      var messages = thread.getMessages();
-      var contactEmail = findExternalEmail(messages, myEmail);
-
-      if (contactEmail) {
-        var normalizedEmail = contactEmail.toLowerCase();
-        var row = emailIndex[normalizedEmail];
-        if (row) {
-          // Only set if not already set to a higher priority status
-          if (!activeFollowUps[normalizedEmail]) {
-            setCell(contactsSheet, row, headers['CRM_FollowUpStatus'], 'Follow-Up');
-            activeFollowUps[normalizedEmail] = 'Follow-Up';
-            stats.followups++;
-            stats.updated++;
-          }
-        }
-      }
-    }
-  }
-
-  // Check Waiting Reply labeled emails (user sent, waiting for their response)
-  var waitingLabel = GmailApp.getUserLabelByName(FOLLOWUP_LABELS.WAITING);
-  if (waitingLabel) {
-    var waitingThreads = waitingLabel.getThreads(0, 100);
-    for (var k = 0; k < waitingThreads.length; k++) {
-      var thread = waitingThreads[k];
-      var messages = thread.getMessages();
-      var contactEmail = findExternalEmail(messages, myEmail);
-
-      if (contactEmail) {
-        var normalizedEmail = contactEmail.toLowerCase();
-        var row = emailIndex[normalizedEmail];
-        if (row) {
-          // Only set if not already set to a higher priority status
-          if (!activeFollowUps[normalizedEmail]) {
-            setCell(contactsSheet, row, headers['CRM_FollowUpStatus'], 'Waiting Reply');
-            activeFollowUps[normalizedEmail] = 'Waiting Reply';
-            stats.updated++;
-          }
-        }
-      }
-    }
-  }
-
-  // Clear follow-up status for contacts that no longer have any follow-up labels
-  var followUpCol = headers['CRM_FollowUpStatus'];
+  // Read existing sheet data for batch update
   var lastRow = contactsSheet.getLastRow();
+  var existingData = {};
   if (lastRow >= CONFIG.DATA_START_ROW) {
     var emailData = contactsSheet.getRange(CONFIG.DATA_START_ROW, CONFIG.EMAIL_COLUMN, lastRow - CONFIG.DATA_START_ROW + 1, 1).getValues();
-    var statusData = contactsSheet.getRange(CONFIG.DATA_START_ROW, followUpCol, lastRow - CONFIG.DATA_START_ROW + 1, 1).getValues();
+    var statusCol = headers['CRM_FollowUpStatus'];
+    var statusSetAtCol = headers['CRM_FollowUpStatusSetAt'];
 
-    for (var r = 0; r < emailData.length; r++) {
-      var email = (emailData[r][0] || '').toString().toLowerCase().trim();
-      var currentStatus = statusData[r][0] || '';
+    if (statusCol) {
+      var statusData = contactsSheet.getRange(CONFIG.DATA_START_ROW, statusCol, lastRow - CONFIG.DATA_START_ROW + 1, 1).getValues();
+      var statusSetAtData = statusSetAtCol ?
+        contactsSheet.getRange(CONFIG.DATA_START_ROW, statusSetAtCol, lastRow - CONFIG.DATA_START_ROW + 1, 1).getValues() : null;
 
-      // If contact has a follow-up status but is NOT in our active list, clear it
-      if (email && currentStatus && !activeFollowUps[email]) {
-        contactsSheet.getRange(CONFIG.DATA_START_ROW + r, followUpCol).setValue('');
-        stats.cleared++;
-        stats.updated++;
+      for (var r = 0; r < emailData.length; r++) {
+        var email = (emailData[r][0] || '').toString().toLowerCase().trim();
+        if (email) {
+          existingData[email] = {
+            row: CONFIG.DATA_START_ROW + r,
+            status: statusData[r][0] || '',
+            statusSetAt: statusSetAtData ? statusSetAtData[r][0] : null
+          };
+        }
       }
     }
   }
 
+  // Prepare batch updates
+  var updates = []; // { row, col, value }
+  var now = new Date();
+
+  // Process each contact with labeled threads
+  for (var contactEmail in contactThreads) {
+    var candidates = contactThreads[contactEmail];
+    var winner = selectWinnerThread(candidates);
+    if (!winner) continue;
+
+    var row = emailIndex[contactEmail];
+    if (!row) continue; // Contact not in sheet
+
+    var existing = existingData[contactEmail] || {};
+    var statusChanged = existing.status !== winner.status;
+
+    // Update status
+    updates.push({ row: row, col: headers['CRM_FollowUpStatus'], value: winner.status });
+
+    // Update StatusSetAt if status changed or wasn't set
+    if (statusChanged || !existing.statusSetAt) {
+      updates.push({ row: row, col: headers['CRM_FollowUpStatusSetAt'], value: now });
+    }
+
+    // Update timestamps
+    if (headers['CRM_LastInboundAt'] && winner.activity.lastInboundAt) {
+      updates.push({ row: row, col: headers['CRM_LastInboundAt'], value: winner.activity.lastInboundAt });
+    }
+    if (headers['CRM_LastOutboundAt'] && winner.activity.lastOutboundAt) {
+      updates.push({ row: row, col: headers['CRM_LastOutboundAt'], value: winner.activity.lastOutboundAt });
+    }
+
+    // Update DaysInStatus
+    if (headers['CRM_DaysInStatus']) {
+      var setAt = statusChanged ? now : (existing.statusSetAt || now);
+      var days = Math.floor((now.getTime() - new Date(setAt).getTime()) / 86400000);
+      updates.push({ row: row, col: headers['CRM_DaysInStatus'], value: days });
+    }
+
+    // Update source info
+    if (headers['CRM_FollowUpSource']) {
+      var relevantDate = winner.status === 'Needs Response' ? winner.activity.lastInboundAt :
+                         winner.status === 'Waiting Reply' ? winner.activity.lastOutboundAt :
+                         winner.activity.lastMessageAt;
+      var dateStr = relevantDate ? Utilities.formatDate(relevantDate, Session.getScriptTimeZone(), 'yyyy-MM-dd') : '';
+      var source = winner.status + ' | "' + winner.activity.subject.substring(0, 30) + '..." | ' + dateStr;
+      updates.push({ row: row, col: headers['CRM_FollowUpSource'], value: source });
+    }
+
+    // Update thread ID
+    if (headers['CRM_LastThreadId']) {
+      updates.push({ row: row, col: headers['CRM_LastThreadId'], value: winner.activity.threadId });
+    }
+
+    // Track stats
+    if (winner.status === 'Needs Response') stats.needsResponse++;
+    else if (winner.status === 'Follow-Up') stats.followups++;
+    else if (winner.status === 'Waiting Reply') stats.waitingReply++;
+
+    if (statusChanged) stats.updated++;
+
+    // Remove from existing to track what needs clearing
+    delete existingData[contactEmail];
+  }
+
+  // Clear statuses for contacts no longer in any labeled threads
+  for (var oldEmail in existingData) {
+    var oldData = existingData[oldEmail];
+    if (oldData.status) {
+      updates.push({ row: oldData.row, col: headers['CRM_FollowUpStatus'], value: '' });
+      if (headers['CRM_FollowUpStatusSetAt']) {
+        updates.push({ row: oldData.row, col: headers['CRM_FollowUpStatusSetAt'], value: '' });
+      }
+      if (headers['CRM_DaysInStatus']) {
+        updates.push({ row: oldData.row, col: headers['CRM_DaysInStatus'], value: '' });
+      }
+      if (headers['CRM_FollowUpSource']) {
+        updates.push({ row: oldData.row, col: headers['CRM_FollowUpSource'], value: '' });
+      }
+      if (headers['CRM_LastThreadId']) {
+        updates.push({ row: oldData.row, col: headers['CRM_LastThreadId'], value: '' });
+      }
+      stats.cleared++;
+      stats.updated++;
+    }
+  }
+
+  // Apply all updates
+  for (var u = 0; u < updates.length; u++) {
+    var upd = updates[u];
+    if (upd.row && upd.col) {
+      contactsSheet.getRange(upd.row, upd.col).setValue(upd.value);
+    }
+  }
+
+  logInfo('syncFollowUps', 'Completed: ' + stats.threadsScanned + ' threads, ' + stats.transitions + ' transitions, ' + stats.updated + ' contacts updated');
+
   return stats;
+}
+
+/**
+ * Setup conditional formatting and data validation for follow-up columns
+ */
+function setupFollowUpFormatting() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var contactsSheet = ss.getSheetByName(CONFIG.CONTACTS_SHEET);
+  var headers = getHeaderMap(contactsSheet);
+  var ui = SpreadsheetApp.getUi();
+
+  if (!headers['CRM_FollowUpStatus']) {
+    ui.alert('Error', 'Follow-up columns not found. Please run Setup first.', ui.ButtonSet.OK);
+    return;
+  }
+
+  var lastRow = Math.max(contactsSheet.getLastRow(), 100);
+  var statusCol = headers['CRM_FollowUpStatus'];
+  var statusRange = contactsSheet.getRange(CONFIG.DATA_START_ROW, statusCol, lastRow, 1);
+
+  // Add data validation dropdown
+  var validStatuses = ['', 'Needs Response', 'Follow-Up', 'Waiting Reply'];
+  var rule = SpreadsheetApp.newDataValidation()
+    .requireValueInList(validStatuses, true)
+    .setAllowInvalid(false)
+    .build();
+  statusRange.setDataValidation(rule);
+
+  // Clear existing conditional formatting rules for this column
+  var rules = contactsSheet.getConditionalFormatRules();
+  var newRules = [];
+  for (var i = 0; i < rules.length; i++) {
+    var ranges = rules[i].getRanges();
+    var keepRule = true;
+    for (var r = 0; r < ranges.length; r++) {
+      if (ranges[r].getColumn() === statusCol) {
+        keepRule = false;
+        break;
+      }
+    }
+    if (keepRule) newRules.push(rules[i]);
+  }
+
+  // Add new conditional formatting rules
+  // Needs Response - Red/urgent
+  newRules.push(SpreadsheetApp.newConditionalFormatRule()
+    .whenTextEqualTo('Needs Response')
+    .setBackground('#f4cccc')
+    .setFontColor('#990000')
+    .setBold(true)
+    .setRanges([statusRange])
+    .build());
+
+  // Follow-Up - Orange/medium
+  newRules.push(SpreadsheetApp.newConditionalFormatRule()
+    .whenTextEqualTo('Follow-Up')
+    .setBackground('#fce5cd')
+    .setFontColor('#b45f06')
+    .setBold(true)
+    .setRanges([statusRange])
+    .build());
+
+  // Waiting Reply - Yellow/low
+  newRules.push(SpreadsheetApp.newConditionalFormatRule()
+    .whenTextEqualTo('Waiting Reply')
+    .setBackground('#fff2cc')
+    .setFontColor('#7f6000')
+    .setRanges([statusRange])
+    .build());
+
+  // Days in status - add gradient if column exists
+  if (headers['CRM_DaysInStatus']) {
+    var daysCol = headers['CRM_DaysInStatus'];
+    var daysRange = contactsSheet.getRange(CONFIG.DATA_START_ROW, daysCol, lastRow, 1);
+
+    // > 7 days warning
+    newRules.push(SpreadsheetApp.newConditionalFormatRule()
+      .whenNumberGreaterThan(7)
+      .setBackground('#ffcdd2')
+      .setRanges([daysRange])
+      .build());
+
+    // 3-7 days caution
+    newRules.push(SpreadsheetApp.newConditionalFormatRule()
+      .whenNumberBetween(3, 7)
+      .setBackground('#ffe0b2')
+      .setRanges([daysRange])
+      .build());
+  }
+
+  contactsSheet.setConditionalFormatRules(newRules);
+
+  // Freeze header row if not already
+  if (contactsSheet.getFrozenRows() < 1) {
+    contactsSheet.setFrozenRows(1);
+  }
+
+  // Enable filter if not already
+  var filter = contactsSheet.getFilter();
+  if (!filter) {
+    var dataRange = contactsSheet.getDataRange();
+    dataRange.createFilter();
+  }
+
+  ui.alert('Formatting Applied',
+    'Added:\n' +
+    '• Status dropdown validation\n' +
+    '• Conditional formatting (red/orange/yellow)\n' +
+    '• Days aging warning colors\n' +
+    '• Header row frozen\n' +
+    '• Filter enabled',
+    ui.ButtonSet.OK);
 }
 
 // ============================================================================
