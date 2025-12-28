@@ -105,10 +105,12 @@ function onOpen() {
       .addSeparator()
       .addItem('Clear All Excludes', 'clearAllExcludes')
       .addItem('View All Settings', 'viewSettings'))
+    .addItem('📅 Set Gmail Date Range', 'setGmailDateRange')
     .addSeparator()
     .addItem('📊 Stats', 'showStats')
     .addItem('📋 View Logs', 'viewLogs')
-    .addItem('🔧 Debug Headers', 'debugHeaders');
+    .addItem('🔧 Debug Headers', 'debugHeaders')
+    .addItem('🆔 Assign Missing IDs', 'assignMissingIds');
 
   menu.addToUi();
 }
@@ -193,6 +195,7 @@ function setupSettingsSheet(ss) {
     settings.appendRow(['EXCLUDE_DOMAINS', '', 'Comma-separated domains to exclude']);
     settings.appendRow(['INTERNAL_DOMAIN', '', 'Your company domain']);
     settings.appendRow(['EXCLUDE_PROMOTIONAL', 'TRUE', 'Skip promotional/marketing emails']);
+    settings.appendRow(['GMAIL_DAYS_BACK', '730', 'How many days back to sync Gmail (e.g., 365, 730, 1095)']);
 
     settings.setColumnWidth(2, 300);
     settings.setColumnWidth(3, 400);
@@ -356,14 +359,67 @@ function clearAllExcludes() {
 
 function viewSettings() {
   var settings = getSettings();
+  var gmailDays = settings['GMAIL_DAYS_BACK'] || '730';
+  var years = (parseInt(gmailDays, 10) / 365).toFixed(1);
   SpreadsheetApp.getUi().alert('Settings',
     'Exclude Internal: ' + (settings['EXCLUDE_INTERNAL'] || 'FALSE') + '\n' +
     'Internal Domain: ' + (settings['INTERNAL_DOMAIN'] || '(not set)') + '\n' +
     'Exclude Emails: ' + (settings['EXCLUDE_EMAILS'] || '(none)') + '\n' +
     'Exclude Subjects: ' + (settings['EXCLUDE_SUBJECTS'] || '(none)') + '\n' +
     'Exclude Domains: ' + (settings['EXCLUDE_DOMAINS'] || '(none)') + '\n' +
-    'Exclude Promotional: ' + (settings['EXCLUDE_PROMOTIONAL'] !== 'FALSE' ? 'TRUE' : 'FALSE'),
+    'Exclude Promotional: ' + (settings['EXCLUDE_PROMOTIONAL'] !== 'FALSE' ? 'TRUE' : 'FALSE') + '\n' +
+    'Gmail Date Range: ' + gmailDays + ' days (~' + years + ' years)',
     SpreadsheetApp.getUi().ButtonSet.OK);
+}
+
+function setGmailDateRange() {
+  var ui = SpreadsheetApp.getUi();
+  var settings = getSettings();
+  var currentDays = settings['GMAIL_DAYS_BACK'] || '730';
+
+  var response = ui.prompt('Set Gmail Date Range',
+    'Enter how many days back to sync Gmail emails.\n\n' +
+    'Examples:\n' +
+    '- 365 = 1 year\n' +
+    '- 730 = 2 years\n' +
+    '- 1095 = 3 years\n' +
+    '- 1825 = 5 years\n\n' +
+    'Current: ' + currentDays + ' days\n\n' +
+    'Note: Larger ranges will take longer to sync.',
+    ui.ButtonSet.OK_CANCEL);
+
+  if (response.getSelectedButton() === ui.Button.OK) {
+    var days = parseInt(response.getResponseText().trim(), 10);
+    if (isNaN(days) || days < 1) {
+      ui.alert('Error', 'Please enter a valid number of days (e.g., 365, 730, 1095).', ui.ButtonSet.OK);
+      return;
+    }
+
+    // Add or update the setting
+    var ss = SpreadsheetApp.getActiveSpreadsheet();
+    var settingsSheet = ss.getSheetByName(CONFIG.SETTINGS_SHEET);
+
+    if (settingsSheet) {
+      var found = false;
+      var lastRow = settingsSheet.getLastRow();
+      for (var i = 2; i <= lastRow; i++) {
+        if (settingsSheet.getRange(i, 1).getValue() === 'GMAIL_DAYS_BACK') {
+          settingsSheet.getRange(i, 2).setValue(String(days));
+          found = true;
+          break;
+        }
+      }
+      if (!found) {
+        settingsSheet.appendRow(['GMAIL_DAYS_BACK', String(days), 'How many days back to sync Gmail (e.g., 365, 730, 1095)']);
+      }
+    }
+
+    var years = (days / 365).toFixed(1);
+    ui.alert('Date Range Updated',
+      'Gmail sync will now go back ' + days + ' days (~' + years + ' years).\n\n' +
+      'Run "Sync Gmail" to pull in older emails.',
+      ui.ButtonSet.OK);
+  }
 }
 
 // ============================================================================
@@ -495,6 +551,10 @@ function syncGmailInternal() {
   var excludeDomains = parseList(settings['EXCLUDE_DOMAINS']);
   var excludePromotional = settings['EXCLUDE_PROMOTIONAL'] !== 'FALSE'; // Default TRUE
 
+  // Get Gmail date range from settings (default to CONFIG value)
+  var gmailDaysBack = parseInt(settings['GMAIL_DAYS_BACK'], 10) || 730;
+  var gmailQuery = 'newer_than:' + gmailDaysBack + 'd';
+
   // Remove duplicates first
   var duplicatesRemoved = removeDuplicateContacts(contactsSheet, historySheet);
 
@@ -507,7 +567,7 @@ function syncGmailInternal() {
   var historyHeaders = getHeaderMap(historySheet);
 
   var myEmail = Session.getActiveUser().getEmail().toLowerCase();
-  var threads = GmailApp.search(CONFIG.GMAIL_QUERY, 0, CONFIG.MAX_THREADS);
+  var threads = GmailApp.search(gmailQuery, 0, CONFIG.MAX_THREADS);
 
   // Debug: check which header columns exist
   var headerDebug = 'ID:' + (headers['CRM_LastDate'] ? headers['CRM_LastDate'] : 'X');
@@ -515,9 +575,7 @@ function syncGmailInternal() {
   var stats = { processed: 0, newContacts: 0, updated: 0, excluded: 0, removed: removed, duplicates: duplicatesRemoved, totalContacts: Object.keys(emailIndex).length, headerDebug: headerDebug };
   var sheetUrl = ss.getUrl();
 
-  // Collect batch updates: { row: { col: value, ... }, ... }
-  var contactUpdates = {};
-  var historyUpdates = {};
+  // Track new contacts to add
   var newContactRows = [];
 
   for (var i = 0; i < threads.length; i++) {
@@ -525,71 +583,114 @@ function syncGmailInternal() {
     var messages = thread.getMessages();
     if (!messages || messages.length === 0) continue;
 
-    var contactEmail = findExternalEmail(messages, myEmail);
-    if (!contactEmail) continue;
+    // Get ALL external emails from this thread (not just one)
+    var allExternalEmails = findAllExternalEmails(messages, myEmail);
+    if (allExternalEmails.length === 0) continue;
 
     var subject = (thread.getFirstMessageSubject() || '').toLowerCase();
-    var domain = contactEmail.split('@')[1] || '';
-    var normalizedEmail = contactEmail.toLowerCase().trim();
-
-    // Apply exclusions
-    if (shouldExclude(normalizedEmail, subject, domain, excludeEmails, excludeSubjects, excludeDomains, excludeInternal, internalDomain, excludePromotional, thread)) {
-      stats.excluded++;
-      continue;
-    }
-
-    stats.processed++;
-    var normalized = contactEmail.toLowerCase().trim();
-
     var lastMsg = messages[messages.length - 1];
     var fromEmail = extractEmail(lastMsg.getFrom());
     var direction = (fromEmail === myEmail) ? 'Sent' : 'Received';
 
-    // Update or add contact - check index first to prevent duplicates
-    var contactRow = emailIndex[normalized];
-    if (contactRow) {
-      stats.updated++;
-      // Ensure CRM_ID exists for existing contacts
-      if (headers['CRM_ID']) {
-        var existingId = contactsSheet.getRange(contactRow, headers['CRM_ID']).getValue();
-        if (!existingId) {
-          contactsSheet.getRange(contactRow, headers['CRM_ID']).setValue('C' + Date.now() + i);
-        }
+    // Process each external email found in the thread
+    var threadProcessed = false;
+    for (var e = 0; e < allExternalEmails.length; e++) {
+      var contactEmail = allExternalEmails[e];
+      var domain = contactEmail.split('@')[1] || '';
+      var normalized = contactEmail.toLowerCase().trim();
+
+      // Apply exclusions
+      if (shouldExclude(normalized, subject, domain, excludeEmails, excludeSubjects, excludeDomains, excludeInternal, internalDomain, excludePromotional, thread)) {
+        stats.excluded++;
+        continue;
       }
-    } else {
-      // Add new contact - queue for batch add
-      contactRow = contactsSheet.getLastRow() + 1 + newContactRows.length;
-      newContactRows.push({ row: contactRow, email: contactEmail, id: 'C' + Date.now() + i });
-      emailIndex[normalized] = contactRow;
-      stats.newContacts++;
+
+      // Check if this contact exists in our sheet
+      var contactRow = emailIndex[normalized];
+
+      if (contactRow) {
+        // Contact exists - update their Gmail columns
+        stats.updated++;
+
+        // Ensure CRM_ID exists for existing contacts
+        if (headers['CRM_ID']) {
+          var existingId = contactsSheet.getRange(contactRow, headers['CRM_ID']).getValue();
+          if (!existingId) {
+            contactsSheet.getRange(contactRow, headers['CRM_ID']).setValue('C' + Date.now() + i + e);
+          }
+        }
+
+        // Update Gmail columns directly using setValue
+        if (headers['CRM_LastDate']) {
+          contactsSheet.getRange(contactRow, headers['CRM_LastDate']).setValue(lastMsg.getDate());
+        }
+        if (headers['CRM_LastSubject']) {
+          contactsSheet.getRange(contactRow, headers['CRM_LastSubject']).setValue(thread.getFirstMessageSubject() || '');
+        }
+        if (headers['CRM_LastPreview']) {
+          contactsSheet.getRange(contactRow, headers['CRM_LastPreview']).setValue((lastMsg.getPlainBody() || '').substring(0, 200).replace(/\s+/g, ' '));
+        }
+        if (headers['CRM_Direction']) {
+          contactsSheet.getRange(contactRow, headers['CRM_Direction']).setValue(direction);
+        }
+
+        // Update Email History
+        updateEmailHistory(historySheet, historyHeaders, normalized, contactEmail, lastMsg, thread, direction, historyIndex);
+
+        // Update history link
+        var historyRow = historyIndex[normalized];
+        var contactLinkCol = historyHeaders['ContactLink'];
+        if (historyRow && contactLinkCol && headers['CRM_HistoryLink']) {
+          var historyLink = sheetUrl + '#gid=' + historySheet.getSheetId() + '&range=A' + historyRow;
+          contactsSheet.getRange(contactRow, headers['CRM_HistoryLink']).setValue(historyLink);
+          historySheet.getRange(historyRow, contactLinkCol).setValue(
+            sheetUrl + '#gid=' + contactsSheet.getSheetId() + '&range=A' + contactRow
+          );
+        }
+
+        threadProcessed = true;
+      } else if (e === 0) {
+        // Only add new contact for the PRIMARY external email (first one found)
+        // This prevents creating hundreds of contacts from CC lists
+        contactRow = contactsSheet.getLastRow() + 1 + newContactRows.length;
+        newContactRows.push({ row: contactRow, email: contactEmail, id: 'C' + Date.now() + i });
+        emailIndex[normalized] = contactRow;
+        stats.newContacts++;
+
+        // Update Gmail columns for new contact
+        if (headers['CRM_LastDate']) {
+          contactsSheet.getRange(contactRow, headers['CRM_LastDate']).setValue(lastMsg.getDate());
+        }
+        if (headers['CRM_LastSubject']) {
+          contactsSheet.getRange(contactRow, headers['CRM_LastSubject']).setValue(thread.getFirstMessageSubject() || '');
+        }
+        if (headers['CRM_LastPreview']) {
+          contactsSheet.getRange(contactRow, headers['CRM_LastPreview']).setValue((lastMsg.getPlainBody() || '').substring(0, 200).replace(/\s+/g, ' '));
+        }
+        if (headers['CRM_Direction']) {
+          contactsSheet.getRange(contactRow, headers['CRM_Direction']).setValue(direction);
+        }
+
+        // Update Email History
+        updateEmailHistory(historySheet, historyHeaders, normalized, contactEmail, lastMsg, thread, direction, historyIndex);
+
+        // Update history link
+        var historyRowNew = historyIndex[normalized];
+        var contactLinkColNew = historyHeaders['ContactLink'];
+        if (historyRowNew && contactLinkColNew && headers['CRM_HistoryLink']) {
+          var historyLinkNew = sheetUrl + '#gid=' + historySheet.getSheetId() + '&range=A' + historyRowNew;
+          contactsSheet.getRange(contactRow, headers['CRM_HistoryLink']).setValue(historyLinkNew);
+          historySheet.getRange(historyRowNew, contactLinkColNew).setValue(
+            sheetUrl + '#gid=' + contactsSheet.getSheetId() + '&range=A' + contactRow
+          );
+        }
+
+        threadProcessed = true;
+      }
     }
 
-    // Update Gmail columns directly using setValue (proven to work)
-    if (headers['CRM_LastDate'] && contactRow > 0) {
-      contactsSheet.getRange(contactRow, headers['CRM_LastDate']).setValue(lastMsg.getDate());
-    }
-    if (headers['CRM_LastSubject'] && contactRow > 0) {
-      contactsSheet.getRange(contactRow, headers['CRM_LastSubject']).setValue(thread.getFirstMessageSubject() || '');
-    }
-    if (headers['CRM_LastPreview'] && contactRow > 0) {
-      contactsSheet.getRange(contactRow, headers['CRM_LastPreview']).setValue((lastMsg.getPlainBody() || '').substring(0, 200).replace(/\s+/g, ' '));
-    }
-    if (headers['CRM_Direction'] && contactRow > 0) {
-      contactsSheet.getRange(contactRow, headers['CRM_Direction']).setValue(direction);
-    }
-
-    // Update Email History
-    updateEmailHistory(historySheet, historyHeaders, normalized, contactEmail, lastMsg, thread, direction, historyIndex);
-
-    // Update history link
-    var historyRow = historyIndex[normalized];
-    var contactLinkCol = historyHeaders['ContactLink'];
-    if (historyRow && contactLinkCol && headers['CRM_HistoryLink'] && contactRow > 0) {
-      var historyLink = sheetUrl + '#gid=' + historySheet.getSheetId() + '&range=A' + historyRow;
-      contactsSheet.getRange(contactRow, headers['CRM_HistoryLink']).setValue(historyLink);
-      historySheet.getRange(historyRow, contactLinkCol).setValue(
-        sheetUrl + '#gid=' + contactsSheet.getSheetId() + '&range=A' + contactRow
-      );
+    if (threadProcessed) {
+      stats.processed++;
     }
   }
 
@@ -714,6 +815,15 @@ function syncCalendarInternal() {
       setCell(contactsSheet, row, headers['CRM_MeetingTitle'], m.title);
       setCell(contactsSheet, row, headers['CRM_MeetingHost'], m.host);
       setCell(contactsSheet, row, headers['CRM_MeetingParticipants'], m.participants);
+
+      // Ensure CRM_ID exists for contacts updated via calendar
+      if (headers['CRM_ID']) {
+        var existingId = contactsSheet.getRange(row, headers['CRM_ID']).getValue();
+        if (!existingId) {
+          contactsSheet.getRange(row, headers['CRM_ID']).setValue('C' + Date.now() + row);
+        }
+      }
+
       stats.updated++;
     }
   }
@@ -1041,8 +1151,8 @@ function scanNeedsResponse() {
 
   // Search for emails in inbox where last message is NOT from me
   // Only look at recent emails (30 days) - older ones are less actionable
-  var labelSearch = FOLLOWUP_LABELS.NEEDS_RESPONSE.replace('/', '-');
-  var threads = GmailApp.search('is:inbox to:me newer_than:30d -label:' + labelSearch, 0, 100);
+  // Gmail label search requires quoting labels with special characters like /
+  var threads = GmailApp.search('is:inbox to:me newer_than:30d -label:"' + FOLLOWUP_LABELS.NEEDS_RESPONSE + '"', 0, 100);
 
   var tagged = 0;
   var questionPatterns = [
@@ -1097,6 +1207,7 @@ function syncFollowUps() {
   SpreadsheetApp.getUi().alert('Follow-up Sync Complete',
     'Contacts with follow-ups: ' + result.followups + '\n' +
     'Contacts needing response: ' + result.needsResponse + '\n' +
+    'Statuses cleared: ' + result.cleared + '\n' +
     'Contacts updated: ' + result.updated,
     SpreadsheetApp.getUi().ButtonSet.OK);
 }
@@ -1107,12 +1218,15 @@ function syncFollowUpsInternal() {
   var headers = getHeaderMap(contactsSheet);
 
   if (!headers['CRM_FollowUpStatus']) {
-    return { followups: 0, needsResponse: 0, updated: 0 };
+    return { followups: 0, needsResponse: 0, updated: 0, cleared: 0 };
   }
 
   var emailIndex = buildEmailIndex(contactsSheet);
   var myEmail = Session.getActiveUser().getEmail().toLowerCase();
-  var stats = { followups: 0, needsResponse: 0, updated: 0 };
+  var stats = { followups: 0, needsResponse: 0, updated: 0, cleared: 0 };
+
+  // Track which contacts have active follow-up labels
+  var activeFollowUps = {};
 
   // Check Needs Response labeled emails (user hasn't replied)
   var needsResponseLabel = GmailApp.getUserLabelByName(FOLLOWUP_LABELS.NEEDS_RESPONSE);
@@ -1124,11 +1238,16 @@ function syncFollowUpsInternal() {
       var contactEmail = findExternalEmail(messages, myEmail);
 
       if (contactEmail) {
-        var row = emailIndex[contactEmail.toLowerCase()];
+        var normalizedEmail = contactEmail.toLowerCase();
+        var row = emailIndex[normalizedEmail];
         if (row) {
-          setCell(contactsSheet, row, headers['CRM_FollowUpStatus'], 'Needs Response');
-          stats.needsResponse++;
-          stats.updated++;
+          // Only set if not already set to a higher priority status
+          if (!activeFollowUps[normalizedEmail]) {
+            setCell(contactsSheet, row, headers['CRM_FollowUpStatus'], 'Needs Response');
+            activeFollowUps[normalizedEmail] = 'Needs Response';
+            stats.needsResponse++;
+            stats.updated++;
+          }
         }
       }
     }
@@ -1144,11 +1263,16 @@ function syncFollowUpsInternal() {
       var contactEmail = findExternalEmail(messages, myEmail);
 
       if (contactEmail) {
-        var row = emailIndex[contactEmail.toLowerCase()];
+        var normalizedEmail = contactEmail.toLowerCase();
+        var row = emailIndex[normalizedEmail];
         if (row) {
-          setCell(contactsSheet, row, headers['CRM_FollowUpStatus'], 'Follow-Up');
-          stats.followups++;
-          stats.updated++;
+          // Only set if not already set to a higher priority status
+          if (!activeFollowUps[normalizedEmail]) {
+            setCell(contactsSheet, row, headers['CRM_FollowUpStatus'], 'Follow-Up');
+            activeFollowUps[normalizedEmail] = 'Follow-Up';
+            stats.followups++;
+            stats.updated++;
+          }
         }
       }
     }
@@ -1164,11 +1288,36 @@ function syncFollowUpsInternal() {
       var contactEmail = findExternalEmail(messages, myEmail);
 
       if (contactEmail) {
-        var row = emailIndex[contactEmail.toLowerCase()];
+        var normalizedEmail = contactEmail.toLowerCase();
+        var row = emailIndex[normalizedEmail];
         if (row) {
-          setCell(contactsSheet, row, headers['CRM_FollowUpStatus'], 'Waiting Reply');
-          stats.updated++;
+          // Only set if not already set to a higher priority status
+          if (!activeFollowUps[normalizedEmail]) {
+            setCell(contactsSheet, row, headers['CRM_FollowUpStatus'], 'Waiting Reply');
+            activeFollowUps[normalizedEmail] = 'Waiting Reply';
+            stats.updated++;
+          }
         }
+      }
+    }
+  }
+
+  // Clear follow-up status for contacts that no longer have any follow-up labels
+  var followUpCol = headers['CRM_FollowUpStatus'];
+  var lastRow = contactsSheet.getLastRow();
+  if (lastRow >= CONFIG.DATA_START_ROW) {
+    var emailData = contactsSheet.getRange(CONFIG.DATA_START_ROW, CONFIG.EMAIL_COLUMN, lastRow - CONFIG.DATA_START_ROW + 1, 1).getValues();
+    var statusData = contactsSheet.getRange(CONFIG.DATA_START_ROW, followUpCol, lastRow - CONFIG.DATA_START_ROW + 1, 1).getValues();
+
+    for (var r = 0; r < emailData.length; r++) {
+      var email = (emailData[r][0] || '').toString().toLowerCase().trim();
+      var currentStatus = statusData[r][0] || '';
+
+      // If contact has a follow-up status but is NOT in our active list, clear it
+      if (email && currentStatus && !activeFollowUps[email]) {
+        contactsSheet.getRange(CONFIG.DATA_START_ROW + r, followUpCol).setValue('');
+        stats.cleared++;
+        stats.updated++;
       }
     }
   }
@@ -1349,8 +1498,8 @@ function shouldExclude(email, subject, domain, excludeEmails, excludeSubjects, e
   // Check Gmail's built-in categories (Promotions, Social, Updates, Forums)
   if (excludePromotional && thread) {
     var labels = thread.getLabels();
-    for (var i = 0; i < labels.length; i++) {
-      var labelName = labels[i].getName().toUpperCase();
+    for (var labelIdx = 0; labelIdx < labels.length; labelIdx++) {
+      var labelName = labels[labelIdx].getName().toUpperCase();
       if (labelName === 'CATEGORY_PROMOTIONS' || labelName === 'CATEGORY_SOCIAL' ||
           labelName === 'CATEGORY_UPDATES' || labelName === 'CATEGORY_FORUMS') {
         return true;
@@ -1460,6 +1609,60 @@ function findExternalEmail(messages, myEmail) {
     if (to && to !== myEmail) return to;
   }
   return null;
+}
+
+/**
+ * Find ALL external emails in a thread (from, to, cc)
+ * Returns array of unique external emails, with the primary contact first
+ */
+function findAllExternalEmails(messages, myEmail) {
+  var emails = {};
+  var primaryEmail = null;
+
+  // Process messages from newest to oldest
+  for (var i = messages.length - 1; i >= 0; i--) {
+    var msg = messages[i];
+
+    // From
+    var from = extractEmail(msg.getFrom());
+    if (from && from !== myEmail) {
+      if (!primaryEmail) primaryEmail = from;
+      emails[from] = true;
+    }
+
+    // To (may have multiple)
+    var toList = (msg.getTo() || '').split(',');
+    for (var t = 0; t < toList.length; t++) {
+      var toEmail = extractEmail(toList[t]);
+      if (toEmail && toEmail !== myEmail) {
+        if (!primaryEmail) primaryEmail = toEmail;
+        emails[toEmail] = true;
+      }
+    }
+
+    // CC (may have multiple)
+    var ccList = (msg.getCc() || '').split(',');
+    for (var c = 0; c < ccList.length; c++) {
+      var ccEmail = extractEmail(ccList[c]);
+      if (ccEmail && ccEmail !== myEmail) {
+        emails[ccEmail] = true;
+      }
+    }
+  }
+
+  // Build result array with primary email first
+  var result = [];
+  if (primaryEmail) {
+    result.push(primaryEmail);
+    delete emails[primaryEmail];
+  }
+
+  // Add remaining emails
+  for (var email in emails) {
+    result.push(email);
+  }
+
+  return result;
 }
 
 function extractEmail(str) {
@@ -1580,6 +1783,54 @@ function showStats() {
     'History rows: ' + historyCount + '\n' +
     'Internal domain: ' + internalDomain + '\n\n' +
     'Enabled integrations: ' + enabled.join(', '),
+    SpreadsheetApp.getUi().ButtonSet.OK);
+}
+
+/**
+ * Assigns CRM_ID to all contacts that don't have one.
+ * This ensures every contact has a unique ID for tracking across integrations.
+ */
+function assignMissingIds() {
+  var ss = SpreadsheetApp.getActiveSpreadsheet();
+  var contactsSheet = ss.getSheetByName(CONFIG.CONTACTS_SHEET);
+  var headers = getHeaderMap(contactsSheet);
+
+  if (!headers['CRM_ID']) {
+    SpreadsheetApp.getUi().alert('Error', 'CRM_ID column not found. Please run Setup first.', SpreadsheetApp.getUi().ButtonSet.OK);
+    return;
+  }
+
+  var lastRow = contactsSheet.getLastRow();
+  if (lastRow < CONFIG.DATA_START_ROW) {
+    SpreadsheetApp.getUi().alert('No Contacts', 'No contacts found to assign IDs.', SpreadsheetApp.getUi().ButtonSet.OK);
+    return;
+  }
+
+  var idCol = headers['CRM_ID'];
+  var emailCol = CONFIG.EMAIL_COLUMN;
+
+  // Read all IDs and emails at once for performance
+  var idData = contactsSheet.getRange(CONFIG.DATA_START_ROW, idCol, lastRow - CONFIG.DATA_START_ROW + 1, 1).getValues();
+  var emailData = contactsSheet.getRange(CONFIG.DATA_START_ROW, emailCol, lastRow - CONFIG.DATA_START_ROW + 1, 1).getValues();
+
+  var assigned = 0;
+  var baseTime = Date.now();
+
+  for (var i = 0; i < idData.length; i++) {
+    var existingId = idData[i][0];
+    var email = emailData[i][0];
+
+    // Only assign ID if the row has an email but no ID
+    if (email && !existingId) {
+      var newId = 'C' + baseTime + (CONFIG.DATA_START_ROW + i);
+      contactsSheet.getRange(CONFIG.DATA_START_ROW + i, idCol).setValue(newId);
+      assigned++;
+    }
+  }
+
+  SpreadsheetApp.getUi().alert('IDs Assigned',
+    'Assigned CRM_ID to ' + assigned + ' contacts.\n' +
+    'Total contacts: ' + emailData.length,
     SpreadsheetApp.getUi().ButtonSet.OK);
 }
 
