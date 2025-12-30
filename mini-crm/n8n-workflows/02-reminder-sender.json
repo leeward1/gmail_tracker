@@ -1,0 +1,292 @@
+{
+  "name": "CRM Stage 3 - Reminder Sender",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 1
+            }
+          ]
+        }
+      },
+      "id": "schedule-trigger",
+      "name": "Every Hour",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [0, 300]
+    },
+    {
+      "parameters": {
+        "operation": "read",
+        "documentId": {
+          "__rl": true,
+          "value": "19TkAK9YN0OlpDe2t6QDytAzc1Bctqm9jh2XyqAvWx8g",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "CRM_Reminders",
+          "mode": "name"
+        },
+        "options": {}
+      },
+      "id": "read-reminders",
+      "name": "Read All Reminders",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [220, 300],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "YOUR_SHEETS_CREDENTIALS_ID",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "const now = new Date();\nconst items = $input.all();\nconst results = [];\n\nfor (let i = 0; i < items.length; i++) {\n  const item = items[i];\n  const status = item.json.status;\n  const nextAttemptAt = item.json.nextAttemptAt ? new Date(item.json.nextAttemptAt) : null;\n  const lockExpiresAt = item.json.lockExpiresAt ? new Date(item.json.lockExpiresAt) : null;\n  const sentKeys = item.json.sentKeys || '';\n  const idempotencyKey = item.json.idempotencyKey || '';\n  \n  // Check if already sent with this idempotency key\n  if (sentKeys.includes(idempotencyKey)) {\n    continue;\n  }\n  \n  // Pick up queued items that are due\n  const isQueuedAndDue = status === 'queued' && nextAttemptAt && nextAttemptAt <= now;\n  \n  // Pick up stale sending items (lock expired)\n  const isStaleLock = status === 'sending' && lockExpiresAt && lockExpiresAt < now;\n  \n  if (isQueuedAndDue || isStaleLock) {\n    results.push({\n      json: {\n        ...item.json,\n        rowIndex: i + 2  // Sheet row number (1-indexed + header)\n      }\n    });\n  }\n}\n\nconsole.log(`Found ${results.length} reminders to process`);\nreturn results;"
+      },
+      "id": "filter-due",
+      "name": "Filter Due Reminders",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [440, 300]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "documentId": {
+          "__rl": true,
+          "value": "19TkAK9YN0OlpDe2t6QDytAzc1Bctqm9jh2XyqAvWx8g",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "CRM_Reminders",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "reminderId": "={{ $json.reminderId }}",
+            "status": "sending",
+            "lockExpiresAt": "={{ $now.plus(5, 'minutes').toISO() }}"
+          }
+        },
+        "options": {
+          "cellFormat": "USER_ENTERED"
+        }
+      },
+      "id": "set-sending",
+      "name": "Set Status = Sending",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [660, 300],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "YOUR_SHEETS_CREDENTIALS_ID",
+          "name": "Google Sheets account"
+        }
+      },
+      "options": {
+        "matchingColumns": ["reminderId"]
+      }
+    },
+    {
+      "parameters": {
+        "sendTo": "gadi@knostic.ai",
+        "subject": "=[ACTION REQUIRED] Reply to: {{ $json.contactEmail }}",
+        "message": "=<h2>📧 Reminder: You need to respond</h2>\n\n<p><strong>From:</strong> {{ $json.contactEmail }}</p>\n<p><strong>Subject:</strong> {{ $json.subject }}</p>\n<p><strong>Date:</strong> {{ $json.createdAt }}</p>\n\n<hr>\n\n<p><strong>Preview:</strong></p>\n<blockquote>{{ $json.snippet }}</blockquote>\n\n<hr>\n\n<p><strong>➡️ Open in Gmail:</strong></p>\n<p><a href=\"{{ $json.gmailSearchLink }}\">Click here to view the email</a></p>\n\n<p><strong>If link doesn't work, search for:</strong></p>\n<code>{{ $json.fallbackSearch }}</code>\n\n<hr>\n<p style=\"color: #666; font-size: 12px;\">Sent by CRM Smart Reminders</p>",
+        "options": {}
+      },
+      "id": "send-email",
+      "name": "Send Reminder Email",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [880, 300],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "YOUR_GMAIL_CREDENTIALS_ID",
+          "name": "Gmail account"
+        }
+      },
+      "onError": "continueErrorOutput"
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "documentId": {
+          "__rl": true,
+          "value": "19TkAK9YN0OlpDe2t6QDytAzc1Bctqm9jh2XyqAvWx8g",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "CRM_Reminders",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "reminderId": "={{ $json.reminderId }}",
+            "status": "sent",
+            "sentAt": "={{ $now.toISO() }}",
+            "sentKeys": "={{ $json.sentKeys ? $json.sentKeys + ',' + $json.idempotencyKey : $json.idempotencyKey }}"
+          }
+        },
+        "options": {
+          "cellFormat": "USER_ENTERED"
+        }
+      },
+      "id": "mark-sent",
+      "name": "Mark as Sent",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [1100, 200],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "YOUR_SHEETS_CREDENTIALS_ID",
+          "name": "Google Sheets account"
+        }
+      },
+      "options": {
+        "matchingColumns": ["reminderId"]
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Calculate backoff for retry\nconst item = $input.item;\nconst attemptCount = parseInt(item.json.attemptCount || '0') + 1;\nconst errorMsg = item.json.error?.message || 'Unknown error';\n\n// Backoff schedule (minutes)\nconst backoffMinutes = {\n  1: 5,\n  2: 30,\n  3: 240  // 4 hours\n};\n\nlet status, nextAttemptAt;\n\nif (attemptCount >= 4) {\n  status = 'abandoned';\n  nextAttemptAt = '';\n} else {\n  status = 'failed';\n  const backoff = backoffMinutes[attemptCount] || 240;\n  nextAttemptAt = new Date(Date.now() + backoff * 60 * 1000).toISOString();\n}\n\nreturn {\n  json: {\n    reminderId: item.json.reminderId,\n    status: status,\n    attemptCount: attemptCount,\n    lastError: errorMsg,\n    nextAttemptAt: nextAttemptAt,\n    lockExpiresAt: ''\n  }\n};"
+      },
+      "id": "calc-backoff",
+      "name": "Calculate Backoff",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1100, 400]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "documentId": {
+          "__rl": true,
+          "value": "19TkAK9YN0OlpDe2t6QDytAzc1Bctqm9jh2XyqAvWx8g",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "CRM_Reminders",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "reminderId": "={{ $json.reminderId }}",
+            "status": "={{ $json.status }}",
+            "attemptCount": "={{ $json.attemptCount }}",
+            "lastError": "={{ $json.lastError }}",
+            "nextAttemptAt": "={{ $json.nextAttemptAt }}",
+            "lockExpiresAt": ""
+          }
+        },
+        "options": {
+          "cellFormat": "USER_ENTERED"
+        }
+      },
+      "id": "mark-failed",
+      "name": "Mark as Failed/Abandoned",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [1320, 400],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "YOUR_SHEETS_CREDENTIALS_ID",
+          "name": "Google Sheets account"
+        }
+      },
+      "options": {
+        "matchingColumns": ["reminderId"]
+      }
+    }
+  ],
+  "connections": {
+    "Every Hour": {
+      "main": [
+        [
+          {
+            "node": "Read All Reminders",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read All Reminders": {
+      "main": [
+        [
+          {
+            "node": "Filter Due Reminders",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter Due Reminders": {
+      "main": [
+        [
+          {
+            "node": "Set Status = Sending",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Set Status = Sending": {
+      "main": [
+        [
+          {
+            "node": "Send Reminder Email",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Reminder Email": {
+      "main": [
+        [
+          {
+            "node": "Mark as Sent",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Calculate Backoff",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Calculate Backoff": {
+      "main": [
+        [
+          {
+            "node": "Mark as Failed/Abandoned",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1",
+    "errorWorkflow": ""
+  }
+}

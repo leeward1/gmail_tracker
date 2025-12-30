@@ -1,0 +1,61 @@
+{
+  "name": "CRM Smart Reminders",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "triggerAtHour": 9
+            }
+          ]
+        }
+      },
+      "id": "648d01ab-155d-4ee6-beca-2496cf510b4a",
+      "name": "Daily at 9 AM",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [0, 0]
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "https://script.google.com/a/macros/knostic.ai/s/AKfycbwf7R_6gv8zOAWR1mBJthV_uiqt6FA6WkhB-41Mp9jDXsrUAhPH-7trcw7brNDAe8cW/exec",
+        "sendQuery": true,
+        "queryParameters": {
+          "parameters": [
+            {
+              "name": "action",
+              "value": "processReminders"
+            }
+          ]
+        },
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "id": "fef64460-f3ff-4a58-afa8-71a0d73f2fd0",
+      "name": "Process Smart Reminders",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [220, 0]
+    }
+  ],
+  "connections": {
+    "Daily at 9 AM": {
+      "main": [
+        [
+          {
+            "node": "Process Smart Reminders",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1"
+  }
+}

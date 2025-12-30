@@ -1,0 +1,303 @@
+{
+  "name": "CRM Stage 1 - Gmail Ingestion",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "hours",
+              "hoursInterval": 1
+            }
+          ]
+        }
+      },
+      "id": "schedule-trigger",
+      "name": "Every Hour",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [0, 300]
+    },
+    {
+      "parameters": {
+        "operation": "getAll",
+        "returnAll": false,
+        "limit": 100,
+        "filters": {
+          "q": "newer_than:2d -category:promotions -category:social -category:updates -category:forums",
+          "labelIds": ["INBOX"]
+        },
+        "options": {}
+      },
+      "id": "gmail-search",
+      "name": "Gmail - Get Recent Emails",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [220, 300],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "YOUR_GMAIL_CREDENTIALS_ID",
+          "name": "Gmail account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": false,
+            "typeValidation": "loose"
+          },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.from.toLowerCase() }}",
+              "rightValue": "noreply",
+              "operator": {
+                "type": "string",
+                "operation": "notContains"
+              }
+            },
+            {
+              "leftValue": "={{ $json.from.toLowerCase() }}",
+              "rightValue": "no-reply",
+              "operator": {
+                "type": "string",
+                "operation": "notContains"
+              }
+            },
+            {
+              "leftValue": "={{ $json.from.toLowerCase() }}",
+              "rightValue": "notifications@",
+              "operator": {
+                "type": "string",
+                "operation": "notContains"
+              }
+            },
+            {
+              "leftValue": "={{ $json.from.toLowerCase() }}",
+              "rightValue": "mailer-daemon",
+              "operator": {
+                "type": "string",
+                "operation": "notContains"
+              }
+            },
+            {
+              "leftValue": "={{ $json.from.toLowerCase() }}",
+              "rightValue": "sendgrid.net",
+              "operator": {
+                "type": "string",
+                "operation": "notContains"
+              }
+            },
+            {
+              "leftValue": "={{ $json.from.toLowerCase() }}",
+              "rightValue": "mailchimp.com",
+              "operator": {
+                "type": "string",
+                "operation": "notContains"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "filter-spam",
+      "name": "Filter Out Spam/Notifications",
+      "type": "n8n-nodes-base.filter",
+      "typeVersion": 2,
+      "position": [440, 300]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Extract email address from \"Name <email>\" format\nfunction extractEmail(str) {\n  if (!str) return '';\n  const match = str.match(/<([^>]+)>/);\n  return match ? match[1].toLowerCase() : str.toLowerCase().trim();\n}\n\n// Get user's email to determine direction\nconst myEmail = 'gadi@knostic.ai'.toLowerCase();\n\nconst items = $input.all();\nconst results = [];\n\nfor (const item of items) {\n  const from = extractEmail(item.json.from);\n  const to = extractEmail(item.json.to);\n  const direction = from === myEmail ? 'Sent' : 'Received';\n  const contactEmail = direction === 'Sent' ? to : from;\n  \n  // Skip internal emails (same domain)\n  const myDomain = myEmail.split('@')[1];\n  const contactDomain = contactEmail.split('@')[1];\n  if (contactDomain === myDomain) continue;\n  \n  // Generate Gmail search links\n  const messageId = item.json.id;\n  const gmailSearchLink = `https://mail.google.com/mail/u/0/#search/rfc822msgid:${messageId}`;\n  const fallbackSearch = `from:${contactEmail} subject:\"${(item.json.subject || '').replace(/\"/g, '')}\"`;\n  \n  results.push({\n    json: {\n      interactionId: 'I' + Date.now() + Math.random().toString(36).substr(2, 5),\n      messageId: messageId,\n      contactEmail: contactEmail,\n      date: item.json.date || new Date().toISOString(),\n      subject: item.json.subject || '(no subject)',\n      direction: direction,\n      fromAddress: item.json.from,\n      snippet: (item.json.snippet || '').substring(0, 200),\n      gmailSearchLink: gmailSearchLink,\n      fallbackSearch: fallbackSearch,\n      processedAt: ''  // Will be filled by Apps Script\n    }\n  });\n}\n\nreturn results;"
+      },
+      "id": "transform-data",
+      "name": "Transform Email Data",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [660, 300]
+    },
+    {
+      "parameters": {
+        "operation": "read",
+        "documentId": {
+          "__rl": true,
+          "value": "19TkAK9YN0OlpDe2t6QDytAzc1Bctqm9jh2XyqAvWx8g",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "CRM_Interactions",
+          "mode": "name"
+        },
+        "options": {
+          "range": "B:B"
+        }
+      },
+      "id": "read-existing",
+      "name": "Read Existing MessageIds",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [220, 100],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "YOUR_SHEETS_CREDENTIALS_ID",
+          "name": "Google Sheets account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "mode": "combine",
+        "combinationMode": "multiplex",
+        "options": {}
+      },
+      "id": "merge-node",
+      "name": "Wait for Both",
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [880, 200]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Get existing messageIds from sheet (first input)\nconst existingIds = new Set();\nconst allItems = $input.all();\n\n// Separate sheet data from email data\nconst sheetItems = [];\nconst emailItems = [];\n\nfor (const item of allItems) {\n  if (item.json.messageId && item.json.interactionId) {\n    // This is transformed email data\n    emailItems.push(item);\n  } else if (item.json.messageId) {\n    // This is from sheet (just messageId column)\n    existingIds.add(item.json.messageId);\n  }\n}\n\n// Filter out already-processed messages\nconst results = [];\nfor (const item of emailItems) {\n  if (!existingIds.has(item.json.messageId)) {\n    results.push(item);\n  }\n}\n\nconsole.log(`Deduped: ${emailItems.length} emails, ${existingIds.size} existing -> ${results.length} new items`);\nreturn results;"
+      },
+      "id": "dedupe",
+      "name": "Dedupe by MessageId",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1100, 200]
+    },
+    {
+      "parameters": {
+        "operation": "append",
+        "documentId": {
+          "__rl": true,
+          "value": "19TkAK9YN0OlpDe2t6QDytAzc1Bctqm9jh2XyqAvWx8g",
+          "mode": "id"
+        },
+        "sheetName": {
+          "__rl": true,
+          "value": "CRM_Interactions",
+          "mode": "name"
+        },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "interactionId": "={{ $json.interactionId }}",
+            "messageId": "={{ $json.messageId }}",
+            "contactEmail": "={{ $json.contactEmail }}",
+            "date": "={{ $json.date }}",
+            "subject": "={{ $json.subject }}",
+            "direction": "={{ $json.direction }}",
+            "fromAddress": "={{ $json.fromAddress }}",
+            "snippet": "={{ $json.snippet }}",
+            "gmailSearchLink": "={{ $json.gmailSearchLink }}",
+            "fallbackSearch": "={{ $json.fallbackSearch }}",
+            "processedAt": ""
+          }
+        },
+        "options": {}
+      },
+      "id": "append-interactions",
+      "name": "Append to Interactions",
+      "type": "n8n-nodes-base.googleSheets",
+      "typeVersion": 4.5,
+      "position": [1320, 200],
+      "credentials": {
+        "googleSheetsOAuth2Api": {
+          "id": "YOUR_SHEETS_CREDENTIALS_ID",
+          "name": "Google Sheets account"
+        }
+      }
+    }
+  ],
+  "connections": {
+    "Every Hour": {
+      "main": [
+        [
+          {
+            "node": "Gmail - Get Recent Emails",
+            "type": "main",
+            "index": 0
+          },
+          {
+            "node": "Read Existing MessageIds",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Gmail - Get Recent Emails": {
+      "main": [
+        [
+          {
+            "node": "Filter Out Spam/Notifications",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Filter Out Spam/Notifications": {
+      "main": [
+        [
+          {
+            "node": "Transform Email Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Transform Email Data": {
+      "main": [
+        [
+          {
+            "node": "Wait for Both",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Read Existing MessageIds": {
+      "main": [
+        [
+          {
+            "node": "Wait for Both",
+            "type": "main",
+            "index": 1
+          }
+        ]
+      ]
+    },
+    "Wait for Both": {
+      "main": [
+        [
+          {
+            "node": "Dedupe by MessageId",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Dedupe by MessageId": {
+      "main": [
+        [
+          {
+            "node": "Append to Interactions",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
